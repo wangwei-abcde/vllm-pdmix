@@ -1779,6 +1779,9 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+        elif self.enable_edge_cloud:
+            # In edge-cloud collaboration mode, all DP instances run on each node
+            self.data_parallel_size_local = self.data_parallel_size
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )

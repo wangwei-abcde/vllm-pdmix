@@ -1128,6 +1128,7 @@ class GroupCoordinator:
 
 _WORLD: GroupCoordinator | None = None
 _INNER_DP_WORLD: GroupCoordinator | None = None
+_INNER_DP_WORLD_EDGE_LIST: list[GroupCoordinator] | None = None
 _NODE_COUNT: int | None = None
 
 
@@ -1139,6 +1140,25 @@ def get_world_group() -> GroupCoordinator:
 def get_inner_dp_world_group() -> GroupCoordinator:
     assert _INNER_DP_WORLD is not None, "inner dp world group is not initialized"
     return _INNER_DP_WORLD
+
+
+def get_inner_dp_world_group_k(k: int) -> GroupCoordinator:
+    """边侧共享模型专用：返回第 k 个 inner_dp_world_edge GroupCoordinator（对应 dp_rank=k）。
+
+    该 GroupCoordinator 的 members 包含 shared edge WorkerProc（rank 0）+ 该 dp_rank 的 c 个云 workers。
+    共享 edge WorkerProc 通过这个 group 用 create_mq_broadcaster / create_single_reader_mq_broadcasters
+    跟对应 dp_rank 的云 workers 通信。
+
+    只有当本进程是边侧 + 开启共享模型时 _INNER_DP_WORLD_EDGE_LIST 才会被初始化。
+    """
+    assert _INNER_DP_WORLD_EDGE_LIST is not None, (
+        "inner_dp_world_edge_list is not initialized; "
+        "this function is only valid for shared model edge side"
+    )
+    assert 0 <= k < len(_INNER_DP_WORLD_EDGE_LIST), (
+        f"k={k} out of range [0, {len(_INNER_DP_WORLD_EDGE_LIST)})"
+    )
+    return _INNER_DP_WORLD_EDGE_LIST[k]
 
 
 def init_world_group(
@@ -1425,7 +1445,30 @@ def init_distributed_environment(
         parallel_config = config.parallel_config
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
-        rank = parallel_config.data_parallel_rank * world_size + rank
+        if config.parallel_config.is_shared_model_edge:
+            # Shared-model topology: the edge has a single
+            # distributed rank (0) shared by all dp ranks; the
+            # cloud has ``dp_size * cloud_npu_count`` ranks laid
+            # out as ``[1 + dp_rank * cloud_npu_count + i for i
+            # in range(cloud_npu_count)]`` for each dp_rank.
+            # ``world_size`` here is the per-dp world_size
+            # (= 1 + cloud_npu_count in shared-model), so
+            # ``world_size - 1`` is ``cloud_npu_count``.
+            # The cloud executor assigns the per-dp cloud ranks
+            # starting at ``edge_npu_count (=1)`` (mirroring the
+            # non-shared edge-cloud layout), so the ``rank`` value
+            # we receive is already ``1 + tp_local_rank``; we just
+            # add the per-dp stride ``data_parallel_rank *
+            # cloud_npu_count`` to get the global rank.
+            if config.parallel_config.is_edge_node:
+                rank = 0
+            else:
+                rank = (
+                    parallel_config.data_parallel_rank * (world_size - 1)
+                    + rank
+                )
+        else:
+            rank = parallel_config.data_parallel_rank * world_size + rank
         # adjust the world size to take into account data parallelism
         world_size = parallel_config.world_size_across_dp
 
@@ -1494,7 +1537,7 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         local_rank = envs.LOCAL_RANK if distributed_init_method == "env://" else rank
 
-    global _WORLD, _NODE_COUNT, _INNER_DP_WORLD
+    global _WORLD, _NODE_COUNT, _INNER_DP_WORLD, _INNER_DP_WORLD_EDGE_LIST
     if enable_elastic_ep:
         _init_elastic_ep_world(config, local_rank, backend, rank, world_size)
         return
@@ -1512,19 +1555,65 @@ def init_distributed_environment(
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
         if parallel_config.data_parallel_size > 1:
-            world_size_inner_dp = parallel_config.world_size
-            group_ranks = [
-                [dp_rank * world_size_inner_dp + i for i in range(world_size_inner_dp)]
-                for dp_rank in range(parallel_config.data_parallel_size)
-            ]
-            _INNER_DP_WORLD = init_model_parallel_group(
-                group_ranks,
-                get_world_group().local_rank,
-                backend,
-                use_message_queue_broadcaster=True,
-                group_name="inner_dp_world",
-                use_device_communicator=False,
-            )
+            if config.parallel_config.is_shared_model_edge:
+                # 共享模型 edge-cloud：构造 group_ranks_full
+                # 每条子组 = [shared_edge_rank (=0)] + 该 dp_rank 的 c 个云 workers
+                # shared edge WorkerProc 的 distributed rank 是 0
+                # （所有 dp_rank 共享同一个 edge rank），
+                # 云 workers 的 distributed rank 是
+                # 1 + dp_rank * cloud_npu_count + i
+                # （云端从 rank 1 开始，dp_size 组依次排列）。
+                cloud_npu_count = parallel_config.cloud_npu_count
+                shared_edge_rank = 0
+                group_ranks_full: list[list[int]] = []
+                for dp_rank in range(parallel_config.data_parallel_size):
+                    cloud_ranks = [
+                        1 + dp_rank * cloud_npu_count + i
+                        for i in range(cloud_npu_count)
+                    ]
+                    group_ranks_full.append([shared_edge_rank] + cloud_ranks)
+
+                # 边侧（is_edge_node=True）：另外创建 dp_size 个独立的 GroupCoordinator
+                # 全部用原名 inner_dp_world（共享同一份底层 gloo process group）
+                if config.parallel_config.is_edge_node:
+                    _INNER_DP_WORLD_EDGE_LIST = [
+                        init_model_parallel_group(
+                            [full_ranks],
+                            get_world_group().local_rank,
+                            backend,
+                            use_message_queue_broadcaster=True,
+                            group_name="inner_dp_world",
+                            use_device_communicator=False,
+                        )
+                        for dp_rank, full_ranks in enumerate(group_ranks_full)
+                    ]
+                # 边侧**不**创建 _INNER_DP_WORLD
+
+                # 云侧（is_edge_node=False）：用整个 group_ranks_full 数组构造一个 GroupCoordinator
+                if not config.parallel_config.is_edge_node:
+                    _INNER_DP_WORLD = init_model_parallel_group(
+                        group_ranks_full,
+                        get_world_group().local_rank,
+                        backend,
+                        use_message_queue_broadcaster=True,
+                        group_name="inner_dp_world",
+                        use_device_communicator=False,
+                    )
+            else:
+                # 原标准流程（共享模型关闭）
+                world_size_inner_dp = parallel_config.world_size
+                group_ranks = [
+                    [dp_rank * world_size_inner_dp + i for i in range(world_size_inner_dp)]
+                    for dp_rank in range(parallel_config.data_parallel_size)
+                ]
+                _INNER_DP_WORLD = init_model_parallel_group(
+                    group_ranks,
+                    get_world_group().local_rank,
+                    backend,
+                    use_message_queue_broadcaster=True,
+                    group_name="inner_dp_world",
+                    use_device_communicator=False,
+                )
         else:
             _INNER_DP_WORLD = _WORLD
 
@@ -1571,6 +1660,133 @@ def initialize_model_parallel(
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
+    # Shared-model edge-cloud collaboration mode.
+    # Activated by ``is_shared_model_edge``: the edge side has a
+    # single distributed rank (one process) hosting
+    # ``data_parallel_size`` virtual workers, each sharing the
+    # same NPU model. The cloud side keeps the original layout
+    # (one process per cloud rank, ``cloud_npu_count`` ranks per
+    # DP instance forming a TP group).
+    if parallel_config.is_shared_model_edge:
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        backend = backend or torch.distributed.get_backend(
+            get_world_group().device_group
+        )
+
+        data_parallel_size = config.parallel_config.data_parallel_size
+        cloud_npu_count = config.parallel_config.cloud_npu_count
+        # Expected world size: 1 (edge) + dp_size * cloud_npu_count (cloud).
+        expected_world_size = 1 + data_parallel_size * cloud_npu_count
+        assert world_size == expected_world_size, (
+            f"Shared-model edge-cloud requires world_size = {expected_world_size}, "
+            f"got {world_size}")
+        is_edge = rank < 1
+        _IS_EDGE_DEVICE = is_edge
+
+        # TP groups: edge gets [0] (size 1), each cloud dp instance
+        # gets [base ... base+C-1] (size cloud_npu_count).
+        assert _TP is None, "tensor model parallel group is already initialized"
+        tp_groups: list[list[int]] = [[0]]  # edge TP
+        cloud_first_ranks: list[int] = []  # for later PP/DP construction
+        for dp_idx in range(data_parallel_size):
+            base = 1 + dp_idx * cloud_npu_count
+            tp_groups.append(list(range(base, base + cloud_npu_count)))
+            cloud_first_ranks.append(base)  # first rank in the TP group
+        _TP = init_model_parallel_group(
+            tp_groups,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
+
+        # PP groups:
+        #   - A single shared PP group of size 1 + data_parallel_size
+        #     containing the edge rank (0) and the first rank of each
+        #     cloud DP instance (``cloud_first_ranks``). The edge sits
+        #     at in-group rank 0; cloud_dp_k's first worker is at
+        #     in-group rank k + 1.
+        #   - The remaining cloud ranks (``cloud_npu_count - 1`` per
+        #     DP instance) each have a singleton PP group of size 1.
+        assert _PP is None, "pipeline model parallel group is already initialized"
+        pp_groups: list[list[int]] = [[0] + cloud_first_ranks]
+        for dp_idx in range(data_parallel_size):
+            base = 1 + dp_idx * cloud_npu_count
+            for t in range(1, cloud_npu_count):
+                pp_groups.append([base + t])
+        _PP = init_model_parallel_group(
+            pp_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="pp",
+        )
+
+        # DCP/PCP groups: each rank its own group (size 1).
+        dcp_groups: list[list[int]] = [[r] for r in range(world_size)]
+        assert _DCP is None, "decode context model parallel group is already initialized"
+        _DCP = init_model_parallel_group(
+            dcp_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="dcp",
+        )
+        assert _PCP is None, "prefill context parallel group is already initialized"
+        _PCP = init_model_parallel_group(
+            dcp_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="pcp",
+        )
+
+        # DP groups:
+        #   - Edge: [0] (size 1, the edge alone).
+        #   - Cloud: for each TP position ``t`` in 0..C-1, the
+        #     cloud ranks at position ``t`` across all DP instances
+        #     form a DP group: ``[1 + t, 1 + C + t, ..., 1 + (N-1)*C + t]``
+        #     (size data_parallel_size). This mirrors the original
+        #     edge-cloud DP grouping for the cloud side.
+        assert _DP is None, "data parallel group is already initialized"
+        dp_groups: list[list[int]] = [[0]]  # edge DP
+        for t in range(cloud_npu_count):
+            dp_groups.append(
+                [1 + dp_idx * cloud_npu_count + t
+                 for dp_idx in range(data_parallel_size)])
+        _DP = init_model_parallel_group(
+            dp_groups,
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
+        )
+
+        # EP group: edge [0] and cloud all-cloud-ranks in separate
+        # subgroups (mirrors the original edge-cloud EP layout, just
+        # with the edge as a single-rank subgroup).
+        assert _EP is None, "expert parallel group is already initialized"
+        ep_edge_ranks = [0]
+        ep_cloud_ranks = list(range(1, world_size))
+        _EP = init_model_parallel_group(
+            [ep_edge_ranks, ep_cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="ep",
+        )
+
+        logger.info(
+            "Shared-model edge-cloud mode initialized: "
+            "rank %s, is_edge=%s, cloud_npu_count=%s, "
+            "data_parallel_size=%s, world_size=%s, TP groups=%s, "
+            "PP groups=%s, DP groups=%s",
+            rank,
+            is_edge,
+            cloud_npu_count,
+            data_parallel_size,
+            world_size,
+            tp_groups,
+            pp_groups,
+            dp_groups,
+        )
+        return
     if parallel_config.enable_edge_cloud:
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
@@ -1578,74 +1794,118 @@ def initialize_model_parallel(
             get_world_group().device_group
         )
         edge_npu_count = parallel_config.edge_npu_count
-        is_edge = rank < edge_npu_count
+        cloud_npu_count = parallel_config.cloud_npu_count
+        data_parallel_size = parallel_config.data_parallel_size
+        world_size_per_instance = edge_npu_count + cloud_npu_count
+        # Use local_rank within dp instance to determine is_edge
+        local_rank = rank % world_size_per_instance
+        is_edge = local_rank < edge_npu_count
         _IS_EDGE_DEVICE = is_edge
 
-        tp_edge_ranks = list(range(edge_npu_count))
-        tp_cloud_ranks = list(range(edge_npu_count, world_size))
+        # Build TP group: each side forms its own TP group within each dp instance
+        # All ranks must call new_group together, so all ranks include all subgroups
         assert _TP is None, "tensor model parallel group is already initialized"
+        tp_groups = []
+        for dp_idx in range(data_parallel_size):
+            base = dp_idx * world_size_per_instance
+            tp_edge_ranks = [base + r for r in range(edge_npu_count)]
+            tp_cloud_ranks = [base + edge_npu_count + r for r in range(cloud_npu_count)]
+            tp_groups.append(tp_edge_ranks)
+            tp_groups.append(tp_cloud_ranks)
         _TP = init_model_parallel_group(
-            [tp_edge_ranks, tp_cloud_ranks],
+            tp_groups,
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=True,
             group_name="tp",
         )
 
-        pp_group_ranks = [0, edge_npu_count]
-        pp_other_ranks = [
-            [r] for r in range(world_size) if r not in (0, edge_npu_count)
-        ]
+        # Build PP group: NPU0 on each side forms PP pair within each dp instance
+        # Other ranks have PP group containing only themselves
+        # All ranks must call new_group together, so all ranks include all subgroups
         assert _PP is None, "pipeline model parallel group is already initialized"
+        pp_groups = []
+        for dp_idx in range(data_parallel_size):
+            base = dp_idx * world_size_per_instance
+            pp_groups.append([base + 0, base + edge_npu_count])  # NPU0 PP pair
+            for r in range(1, world_size_per_instance):
+                if r != edge_npu_count:
+                    pp_groups.append([base + r])
         _PP = init_model_parallel_group(
-            [pp_group_ranks] + pp_other_ranks,
+            pp_groups,
             get_world_group().local_rank,
             backend,
             group_name="pp",
         )
 
-        all_ranks = list(range(world_size))
+        # In edge-cloud mode, all_ranks has shape (ExternalDP=1, DP, PP=1, PCP=1, TP=1)
+        # DP groups are formed by reshaping to (world_size/dp, dp)
+        # where each DP group contains dp_size ranks at same position across instances
+        all_ranks = torch.arange(world_size).reshape(
+            -1,
+            data_parallel_size,
+        )  # shape: (world_size/dp, dp)
+        dcp_groups = all_ranks.reshape(-1, 1).unbind(0)  # each group has 1 rank (dcp_size=1)
+        dcp_groups = [x.tolist() for x in dcp_groups]
         assert _DCP is None, "decode context model parallel group is already initialized"
         _DCP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            dcp_groups,
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=True,
             group_name="dcp",
         )
+
+        # PCP group: each rank its own group (pcp_size=1)
         assert _PCP is None, "prefill context parallel group is already initialized"
         _PCP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            dcp_groups,  # same as DCP in edge-cloud mode
             get_world_group().local_rank,
             backend,
             group_name="pcp",
         )
+
+        # DP group: ranks at same position within each dp instance form a group
+        # e.g., world_size=8, dp=2, instance_size=4: groups = [[0,4], [1,5], [2,6], [3,7]]
+        dp_groups = []
+        for pos in range(world_size_per_instance):
+            dp_group = [pos + dp_idx * world_size_per_instance for dp_idx in range(data_parallel_size)]
+            dp_groups.append(dp_group)
         assert _DP is None, "data parallel group is already initialized"
         _DP = init_model_parallel_group(
-            [[r] for r in all_ranks],
+            dp_groups,
             get_world_group().local_rank,
             backend,
             group_name="dp",
         )
         assert _EP is None, "expert parallel group is already initialized"
+        # In edge-cloud mode, all edge workers form one EP group and all cloud workers form another
+        # Ranks are arranged by dp instance: instance0_edge, instance0_cloud, instance1_edge, instance1_cloud
+        ep_edge_ranks = []
+        ep_cloud_ranks = []
+        for dp_idx in range(data_parallel_size):
+            base = dp_idx * world_size_per_instance
+            ep_edge_ranks.extend(range(base, base + edge_npu_count))
+            ep_cloud_ranks.extend(range(base + edge_npu_count, base + world_size_per_instance))
         _EP = init_model_parallel_group(
-            [tp_edge_ranks, tp_cloud_ranks],
+            [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
             backend,
             group_name="ep",
         )
 
-        logger.info_once(
-            "Edge-cloud collaboration mode initialized: rank=%s, is_edge=%s, "
-            "edge_npu_count=%s, cloud_npu_count=%s, TP edge ranks=%s, "
-            "TP cloud ranks=%s, PP group ranks=%s",
+        logger.info(
+            "Edge-Cloud collaboration mode initialized: "
+            "rank %s, local_rank %s, is_edge=%s, edge_npu_count=%s, cloud_npu_count=%s, "
+            "data_parallel_size=%s, TP groups=%s, PP groups=%s",
             rank,
+            local_rank,
             is_edge,
             edge_npu_count,
-            parallel_config.cloud_npu_count,
-            tuple(tp_edge_ranks),
-            tuple(tp_cloud_ranks),
-            tuple(pp_group_ranks),
+            cloud_npu_count,
+            data_parallel_size,
+            tp_groups,
+            pp_groups,
         )
         return
 
@@ -2062,18 +2322,41 @@ def in_the_same_node_as_edge_cloud(
     source_rank: int,
     vllm_config,
 ) -> list[bool]:
+    """
+    Fast path for edge-cloud mode: determine node membership without communication.
+
+    In edge-cloud mode, edge ranks are [0, edge_npu_count) and cloud ranks are
+    [edge_npu_count, world_size). Since edge and cloud are on different physical
+    nodes, we can determine node membership directly from rank values.
+    """
     if isinstance(pg, ProcessGroup):
         ranks = torch.distributed.get_process_group_ranks(pg)
     else:
-        ranks = list(range(pg.world_size))
+        world_size = pg.world_size
+        ranks = list(range(world_size))
 
     edge_npu_count = vllm_config.parallel_config.edge_npu_count
+    world_size_per_instance = edge_npu_count + vllm_config.parallel_config.cloud_npu_count
+
+    # Determine if source_rank is on edge or cloud
+    # ranks list contains global ranks, so we check ranks[source_rank]
+    # When DP is enabled, global ranks are per instance, need to take modulo
     source_global_rank = ranks[source_rank]
-    source_is_edge = source_global_rank < edge_npu_count
-    return [
-        rank < edge_npu_count if source_is_edge else rank >= edge_npu_count
-        for rank in ranks
-    ]
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        source_local_rank = source_global_rank % world_size_per_instance
+        source_is_edge = source_local_rank < edge_npu_count
+    else:
+        source_is_edge = source_global_rank < edge_npu_count
+
+    # All ranks on the same side (edge/cloud) as source are in the same node
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        return [
+            (r % world_size_per_instance) < edge_npu_count
+            if source_is_edge else (r % world_size_per_instance) >= edge_npu_count
+            for r in ranks
+        ]
+    else:
+        return [r < edge_npu_count if source_is_edge else r >= edge_npu_count for r in ranks]
 
 
 def in_the_same_node_as(

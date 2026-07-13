@@ -49,6 +49,19 @@ class Executor(ABC):
         executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
         distributed_executor_backend = parallel_config.distributed_executor_backend
+        # In the shared-model edge-cloud topology the **edge**
+        # side uses a dedicated multiproc executor. The cloud
+        # side keeps using the standard ``MultiprocExecutor``.
+        # The dispatch is based on ``is_shared_model_edge and
+        # is_edge_node`` because the standard ``mp`` / ``uni``
+        # backends are unaware of the per-dp_rank gloo sub-groups
+        # built in ``init_distributed_environment``.
+        if (getattr(parallel_config, "is_shared_model_edge", False)
+                and getattr(parallel_config, "is_edge_node", False)):
+            from vllm.v1.executor.shared_model_multiproc_executor import (
+                SharedModelMultiprocExecutor,
+            )
+            return SharedModelMultiprocExecutor
         # distributed_executor_backend must be set in VllmConfig.__post_init__
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, Executor):
