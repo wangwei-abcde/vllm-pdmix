@@ -61,6 +61,7 @@ class Executor(ABC):
             from vllm.v1.executor.shared_model_multiproc_executor import (
                 SharedModelMultiprocExecutor,
             )
+
             return SharedModelMultiprocExecutor
         # distributed_executor_backend must be set in VllmConfig.__post_init__
         if isinstance(distributed_executor_backend, type):

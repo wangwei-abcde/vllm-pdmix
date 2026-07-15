@@ -1660,6 +1660,7 @@ def initialize_model_parallel(
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
     coord_store: Store | None = None
+
     # Shared-model edge-cloud collaboration mode.
     # Activated by ``is_shared_model_edge``: the edge side has a
     # single distributed rank (one process) hosting
