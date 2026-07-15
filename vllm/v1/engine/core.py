@@ -1216,6 +1216,10 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        logger.error(
+            "[HANG] _process_engine_step: dp_rank=%s model_executed=%s",
+            getattr(self, "dp_rank", "?"), model_executed,
+        )
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
