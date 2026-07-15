@@ -1159,13 +1159,17 @@ class WorkerProc:
             except TimeoutError:
                 continue
 
-            # Skip execute_model from cross-node MQ on pp rank1 workers.
-            # These workers execute model only when triggered by their
-            # local passive EngineCore via local_rpc_broadcast_mq.
+            # Skip execute_model / execute_dummy_batch from cross-node MQ on
+            # pp rank1 (cloud) workers. These workers run model/dummy only
+            # when triggered by their local passive EngineCore via
+            # local_rpc_broadcast_mq (zmq-driven, per-DP). Letting the edge's
+            # cross-node broadcast reach cloud workers would deliver the idle
+            # DP's dummy to the DP that is running real work, breaking the
+            # cross-DP all_reduce pairing (deadlock). See 方案③.
             if (
                 self.local_rpc_broadcast_mq is not None
                 and isinstance(method, str)
-                and method == "execute_model"
+                and method in ("execute_model", "execute_dummy_batch")
             ):
                 continue
 
