@@ -1216,9 +1216,11 @@ class EngineCoreProc(EngineCore):
 
         # Step the engine core.
         outputs, model_executed = self.step_fn()
+        _hang_seq = getattr(self, "_hang_step_seq", 0) + 1
+        self._hang_step_seq = _hang_seq
         logger.error(
-            "[HANG] _process_engine_step: dp_rank=%s model_executed=%s",
-            getattr(self, "dp_rank", "?"), model_executed,
+            "[HANG] _process_engine_step: seq=%s dp_rank=%s model_executed=%s",
+            _hang_seq, getattr(self, "dp_rank", "?"), model_executed,
         )
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
