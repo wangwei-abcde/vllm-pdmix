@@ -1760,10 +1760,28 @@ class DPEngineCoreProc(EngineCoreProc):
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
+                    import vllm_ascend
+                    _has_pd = getattr(self, "_pp_pd_channel", None) is not None
+                    if _has_pd:
+                        logger.warning(
+                            "[DP-SYNC] dp%d SKIP dummy (engines_running=%s, "
+                            "local_unfinished=%s, step=%d) *** PD DEADLOCK RISK ***",
+                            self.dp_rank, self.engines_running,
+                            local_unfinished_reqs, self.step_counter,
+                        )
                     continue
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
+                import vllm_ascend
+                _has_pd2 = getattr(self, "_pp_pd_channel", None) is not None
+                if _has_pd2:
+                    logger.info(
+                        "[DP-SYNC] dp%d EXEC dummy (engines_running=%s, "
+                        "local_unfinished=%s, step=%d)",
+                        self.dp_rank, self.engines_running,
+                        local_unfinished_reqs, self.step_counter,
+                    )
                 self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
@@ -1772,6 +1790,14 @@ class DPEngineCoreProc(EngineCoreProc):
             )
 
             if not self.engines_running:
+                import vllm_ascend
+                _has_pd3 = getattr(self, "_pp_pd_channel", None) is not None
+                if _has_pd3:
+                    logger.warning(
+                        "[DP-SYNC] dp%d engines_running → False "
+                        "(step=%d wave=%d) *** PD DEADLOCK RISK ***",
+                        self.dp_rank, self.step_counter, self.current_wave,
+                    )
                 if self.dp_rank == 0 or not self.has_coordinator:
                     # Notify client that we are pausing the loop.
                     logger.debug(
@@ -1797,9 +1823,20 @@ class DPEngineCoreProc(EngineCoreProc):
         # Optimization - only perform finish-sync all-reduce every 32 steps.
         self.step_counter += 1
         if self.step_counter % 32 != 0:
+            logger.debug(
+                "[DP-SYNC] dp%d _has_global_unfinished_reqs "
+                "step=%d (skip, return True) local_unfinished=%s",
+                self.dp_rank, self.step_counter, local_unfinished,
+            )
             return True
 
-        return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        result = ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
+        logger.info(
+            "[DP-SYNC] dp%d _has_global_unfinished_reqs "
+            "step=%d (REAL all-reduce) local_unfinished=%s → result=%s",
+            self.dp_rank, self.step_counter, local_unfinished, result,
+        )
+        return result
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
