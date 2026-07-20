@@ -1179,7 +1179,7 @@ class WorkerProc:
                             (output_rank is None and self.local_rank == 0)
                             or self.rank == output_rank
                         )
-                        if should_send_ack:
+                        if should_send_ack and scheduler_output.total_num_scheduled_tokens != 0:
                             response_mq = (
                                 self.local_worker_response_mq
                                 if self.local_worker_response_mq is not None
