@@ -1772,7 +1772,16 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                if self._is_coordinated_dp():
+                    # Cross-DP coordination already produces dummy
+                    # SchedulerOutputs (via _schedule_target) when pairing is
+                    # needed; reaching here with not-executed means both DPs
+                    # are waiting for cloud (winner=EMPTY). Do NOT self-drive
+                    # a dummy - that reintroduces the count-drift deadlock.
+                    # Yield briefly and wait for cloud to return work.
+                    time.sleep(0.001)
+                else:
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
