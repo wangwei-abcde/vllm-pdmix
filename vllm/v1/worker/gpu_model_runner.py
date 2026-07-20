@@ -1328,8 +1328,27 @@ class GPUModelRunner(
                     # (see scheduler._make_cached_request_data). .tolist()
                     # yields a native list[int] so downstream list ops
                     # (.append/.extend/.clear/del) keep working.
+
+                    # [DPDS-DEBUG] 检查 all_token_ids 的完整性
+                    _all_ids_len = len(resumed_token_ids)
+                    _all_ids_first5 = resumed_token_ids[:5].tolist() if _all_ids_len > 0 else []
+                    _all_ids_last5 = resumed_token_ids[-5:].tolist() if _all_ids_len >= 5 else _all_ids_first5
+                    logger.info(
+                        "[DPDS-DEBUG][ALL_TOKEN_IDS] req_id=%s "
+                        "num_output_tokens=%d all_token_ids_len=%d "
+                        "first5=%s last5=%s",
+                        req_id, num_output_tokens, _all_ids_len,
+                        _all_ids_first5, _all_ids_last5,
+                    )
+
                     req_state.output_token_ids = resumed_token_ids[
                         -num_output_tokens:].tolist()
+
+                    logger.info(
+                        "[DPDS-DEBUG][RECOVERED_OUTPUT_TOKENS] req_id=%s "
+                        "recovered_tokens=%s",
+                        req_id, req_state.output_token_ids,
+                    )
 
                 reqs_to_add.append(req_state)
                 # Track resumed requests for ngram_gpu full tensor copy
@@ -3473,6 +3492,17 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+            # [DPDS-DEBUG] 采样输出日志
+            logger.info(
+                "[DPDS-DEBUG][SAMPLED] req_id=%s sampled_token_ids=%s "
+                "num_computed_tokens=%d output_token_ids_len=%d "
+                "decode_tokens_last10=%s",
+                req_id, sampled_ids,
+                req_state.num_computed_tokens,
+                len(req_state.output_token_ids),
+                req_state.output_token_ids[-10:],
+            )
+
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
@@ -3528,13 +3558,62 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+
+        # [DPDS-DEBUG] 模型 forward 输入检查
+        if intermediate_tensors is not None:
+            for k, v in intermediate_tensors.items():
+                v_flat = v.flatten()
+                _has_nan = bool(torch.isnan(v).any().item())
+                _has_inf = bool(torch.isinf(v).any().item())
+                logger.info(
+                    "[DPDS-DEBUG][MODEL-FWD-IN] tensor=%s shape=%s dtype=%s "
+                    "mean=%.6f std=%.6f has_nan=%s has_inf=%s",
+                    k, tuple(v.shape), str(v.dtype),
+                    v_flat[:100].float().mean().item(),
+                    v_flat[:100].float().std().item(),
+                    _has_nan, _has_inf,
+                )
+        elif input_ids is not None:
+            _ids_first = input_ids.flatten()[:10].tolist()
+            logger.info(
+                "[DPDS-DEBUG][MODEL-FWD-IN] input_ids_first10=%s input_shape=%s",
+                _ids_first, tuple(input_ids.shape),
+            )
+
+        model_output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+
+        # [DPDS-DEBUG] 模型 forward 输出检查
+        if isinstance(model_output, IntermediateTensors):
+            for k, v in model_output.tensors.items():
+                v_flat = v.flatten()
+                _has_nan = bool(torch.isnan(v).any().item())
+                _has_inf = bool(torch.isinf(v).any().item())
+                logger.info(
+                    "[DPDS-DEBUG][MODEL-FWD-OUT-HIDDEN] tensor=%s shape=%s dtype=%s "
+                    "mean=%.6f std=%.6f has_nan=%s has_inf=%s",
+                    k, tuple(v.shape), str(v.dtype),
+                    v_flat[:100].float().mean().item(),
+                    v_flat[:100].float().std().item(),
+                    _has_nan, _has_inf,
+                )
+        else:
+            _out_shape = tuple(model_output.shape) if model_output is not None else "None"
+            _mo_logits = model_output.flatten()[:50] if model_output is not None else None
+            logger.info(
+                "[DPDS-DEBUG][MODEL-FWD-OUT-LOGITS] shape=%s "
+                "first50_mean=%.6f first50_std=%.6f",
+                _out_shape,
+                _mo_logits.float().mean().item() if _mo_logits is not None else float('nan'),
+                _mo_logits.float().std().item() if _mo_logits is not None else float('nan'),
+            )
+
+        return model_output
 
     @staticmethod
     def _is_uniform_decode(

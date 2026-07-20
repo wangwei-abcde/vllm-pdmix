@@ -890,6 +890,18 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
                 )
 
+                # [DPDS-DEBUG] 前缀缓存命中日志
+                _chunk_prefill_cnt = len(getattr(self, 'chunk_prefill_first', []))
+                _prefill_pending_cnt = len(getattr(self, 'prefill_last_pending', []))
+                logger.info(
+                    "[DPDS-DEBUG][PREFIX-CACHE] num_common_prefix_blocks=%s "
+                    "query_req_id=%s running_count=%d "
+                    "chunk_prefill_first_count=%d prefill_last_pending_count=%d",
+                    str(num_common_prefix_blocks), any_request_id,
+                    len(self.running), _chunk_prefill_cnt,
+                    _prefill_pending_cnt,
+                )
+
         # Construct the scheduler output.
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
