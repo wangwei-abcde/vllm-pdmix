@@ -1103,13 +1103,51 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+
+
+                        if model_parallel_is_initialized():
+                            try:
+                                dp_group = get_dp_group()
+                                batch_type_info = (
+                                    f", batch_type={scheduler_output.batch_type.value}"
+                                    if scheduler_output.total_num_scheduled_tokens != 0
+                                    else " dummy"
+                                )
+                                logger.error(
+                                    "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                                    "world_size=%d, ranks=%s%s",
+                                    loop_step,
+                                    dp_group.rank,
+                                    dp_group.rank_in_group,
+                                    dp_group.world_size,
+                                    dp_group.ranks,
+                                    batch_type_info,
+                                )
+                            except AssertionError:
+                                logger.error("[EDGE-DEQUEUE] DP group not initialized")
+                        loop_step += 1
+
                         # Execute model with the received SchedulerOutput.
+                        # PD-separation: route a dummy-middle
+                        # (total_num_scheduled_tokens == 0, published by the edge's
+                        # _patched_execute_dummy_batch) to execute_dummy_batch
+                        # instead of execute_model. The execute_model path runs
+                        # _wait_pp_send_work (which, for the dummy's
+                        # batch_type=DECODE_FIRST, waits the DECODE hidden channel)
+                        # before reaching _execute_model_cloud's dummy branch - that
+                        # makes a cloud dummy block on a prior real step's
+                        # un-recv'd isend and skews the cross-DP pairing.
+                        # execute_dummy_batch goes straight to _dummy_run (no PP send
+                        # wait), matching how the edge handles its own dummies and
+                        # keeping the cloud/edge dummy paths symmetric.
                         try:
-                            func = getattr(self.worker, "execute_model")
-                            output = func(
-                                scheduler_output,
-                                layer_slice_info=slice_info,
-                            )
+                            if scheduler_output.total_num_scheduled_tokens == 0:
+                                output = self.worker.execute_dummy_batch()
+                            else:
+                                output = self.worker.execute_model(
+                                    scheduler_output,
+                                    layer_slice_info=slice_info,
+                                )
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
@@ -1197,7 +1235,7 @@ class WorkerProc:
                             batch_type_info = (
                                 f", batch_type={_bt.value}"
                                 if method == "execute_model" and _bt is not None
-                                else "dummy"
+                                else " dummy"
                             )
                             logger.error(
                                 "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
