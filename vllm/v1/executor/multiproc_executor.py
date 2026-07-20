@@ -1104,28 +1104,28 @@ class WorkerProc:
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
 
-
+                        dp_group = None
                         if model_parallel_is_initialized():
                             try:
                                 dp_group = get_dp_group()
-                                batch_type_info = (
-                                    f", batch_type={scheduler_output.batch_type.value}"
-                                    if scheduler_output.total_num_scheduled_tokens != 0
-                                    else " dummy"
-                                )
-                                logger.error(
-                                    "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
-                                    "world_size=%d, ranks=%s%s",
-                                    loop_step,
-                                    dp_group.rank,
-                                    dp_group.rank_in_group,
-                                    dp_group.world_size,
-                                    dp_group.ranks,
-                                    batch_type_info,
-                                )
                             except AssertionError:
                                 logger.error("[EDGE-DEQUEUE] DP group not initialized")
-                        loop_step += 1
+
+                        batch_type_info = (
+                            f", batch_type={scheduler_output.batch_type.value}"
+                            if scheduler_output.total_num_scheduled_tokens != 0
+                            else " dummy"
+                        )
+                        logger.error(
+                            "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                            "world_size=%d, ranks=%s%s",
+                            loop_step,
+                            dp_group.rank if dp_group is not None else -1,
+                            dp_group.rank_in_group if dp_group is not None else -1,
+                            dp_group.world_size if dp_group is not None else -1,
+                            dp_group.ranks if dp_group is not None else None,
+                            batch_type_info,
+                        )
 
                         # Execute model with the received SchedulerOutput.
                         # PD-separation: route a dummy-middle
@@ -1148,6 +1148,12 @@ class WorkerProc:
                                     scheduler_output,
                                     layer_slice_info=slice_info,
                                 )
+                            logger.error(
+                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                                loop_step,
+                                dp_group.rank if dp_group is not None else -1,
+                            )
+                            loop_step += 1
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
@@ -1229,28 +1235,37 @@ class WorkerProc:
                         _bt.value if _bt is not None else "N/A",
                     )
                 if method in ("execute_model", "execute_dummy_batch"):
+                    dp_group = None
                     if model_parallel_is_initialized():
                         try:
                             dp_group = get_dp_group()
-                            batch_type_info = (
-                                f", batch_type={_bt.value}"
-                                if method == "execute_model" and _bt is not None
-                                else " dummy"
-                            )
-                            logger.error(
-                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
-                                "world_size=%d, ranks=%s%s",
-                                loop_step,
-                                dp_group.rank,
-                                dp_group.rank_in_group,
-                                dp_group.world_size,
-                                dp_group.ranks,
-                                batch_type_info,
-                            )
                         except AssertionError:
                             logger.error("[EDGE-DEQUEUE] DP group not initialized")
-                    loop_step += 1
+
+                    batch_type_info = (
+                        f", batch_type={_bt.value}"
+                        if method == "execute_model" and _bt is not None
+                        else " dummy"
+                    )
+                    logger.error(
+                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                        "world_size=%d, ranks=%s%s",
+                        loop_step,
+                        dp_group.rank if dp_group is not None else -1,
+                        dp_group.rank_in_group if dp_group is not None else -1,
+                        dp_group.world_size if dp_group is not None else -1,
+                        dp_group.ranks if dp_group is not None else None,
+                        batch_type_info,
+                    )
+
                 output = func(*args, **kwargs)
+                if method in ("execute_model", "execute_dummy_batch"):
+                    logger.error(
+                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                        loop_step,
+                        dp_group.rank if dp_group is not None else -1,
+                    )
+                    loop_step += 1
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
