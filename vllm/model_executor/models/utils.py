@@ -664,6 +664,14 @@ def make_layers(
                 real_layers = offloader.wrap_modules(
                     layer_fn(prefix=f"{prefix}.{idx}") for idx in sorted_idx
                 )
+                # [DEBUG] Verify real layers are distinct objects
+                _layer_ids = {idx: id(layer) for idx, layer in zip(sorted_idx, real_layers)}
+                _dup = {i: lid for i, lid in _layer_ids.items()
+                        if list(_layer_ids.values()).count(lid) > 1}
+                if _dup:
+                    logger.warning("[MAKE_LAYERS] DUPLICATE real layers: %s", _dup)
+                logger.info("[MAKE_LAYERS] EdgeCloud: sorted_idx=%s layer_ids=%s",
+                            sorted_idx, _layer_ids)
                 real_iter = iter(zip(sorted_idx, real_layers))
             else:
                 real_iter = iter([])
@@ -681,6 +689,15 @@ def make_layers(
             else:
                 start_layer = 0
                 end_layer = 0
+            # [DEBUG] Verify final ModuleList has no duplicate real layers
+            _ml_ids = {idx: id(m) for idx, m in enumerate(modules_list)
+                       if not isinstance(m, PPMissingLayer)}
+            _ml_dup = {i: lid for i, lid in _ml_ids.items()
+                       if list(_ml_ids.values()).count(lid) > 1}
+            if _ml_dup:
+                logger.warning("[MAKE_LAYERS] DUPLICATE in ModuleList: %s", _ml_dup)
+            logger.info("[MAKE_LAYERS] EdgeCloud ModuleList: real_indices=%s",
+                        sorted(_ml_ids.keys()))
             return start_layer, end_layer, torch.nn.ModuleList(modules_list)
         # Fall through: range not set — use standard contiguous PP split
 
