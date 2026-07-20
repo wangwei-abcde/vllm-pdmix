@@ -1091,6 +1091,7 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        loop_step = 0
         while True:
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
@@ -1178,6 +1179,7 @@ class WorkerProc:
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
+                _bt = None
                 if method == "execute_model":
                     _bt = (
                         getattr(args[0], "batch_type", None)
@@ -1188,6 +1190,28 @@ class WorkerProc:
                         _dt_ms,
                         _bt.value if _bt is not None else "N/A",
                     )
+                if method in ("execute_model", "execute_dummy_batch"):
+                    if model_parallel_is_initialized():
+                        try:
+                            dp_group = get_dp_group()
+                            batch_type_info = (
+                                f", batch_type={_bt.value}"
+                                if method == "execute_model" and _bt is not None
+                                else "dummy"
+                            )
+                            logger.error(
+                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                                "world_size=%d, ranks=%s%s",
+                                loop_step,
+                                dp_group.rank,
+                                dp_group.rank_in_group,
+                                dp_group.world_size,
+                                dp_group.ranks,
+                                batch_type_info,
+                            )
+                        except AssertionError:
+                            logger.error("[EDGE-DEQUEUE] DP group not initialized")
+                    loop_step += 1
                 output = func(*args, **kwargs)
             except Exception as e:
                 # Notes have been introduced in python 3.11
