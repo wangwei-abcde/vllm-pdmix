@@ -1683,52 +1683,11 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_rank = dp_rank
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
-        # Second stateless group for cross-DP batch_type coordination. Uses a
-        # DISTINCT store key ("dp_coord_master_port") so it never races with
-        # the main dp_group's "dp_master_port". A separate communicator is
-        # required so the coord all_reduce stream stays independent of the
-        # has_unfinished_dp all_reduce stream on dp_group (the busy-loop
-        # `continue` path skips has_unfinished + step_counter++, which would
-        # otherwise desync the shared-group all_reduce call count -> hang).
-        self.dp_coord_group = self._init_dp_coord_group(parallel_config)
-
-    def _init_dp_coord_group(self, parallel_config):
-        import socket
-        from vllm.distributed.utils import (
-            get_cached_tcp_store_client,
-            stateless_init_torch_distributed_process_group,
-        )
-        host = parallel_config.data_parallel_master_ip
-        dp_rank = parallel_config.data_parallel_rank
-        dp_size = parallel_config.data_parallel_size
-        store_port = parallel_config._coord_store_port
-        key = "dp_coord_master_port"
-        if store_port:
-            store = get_cached_tcp_store_client(host, store_port)
-            if dp_rank == 0:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.bind((host, 0))
-                s.listen()
-                port = s.getsockname()[1]
-                store.set(key, str(port).encode())
-            else:
-                port = int(store.get(key).decode())
-                s = None
-        else:
-            port = parallel_config.get_next_dp_init_port()
-            s = None
-        return stateless_init_torch_distributed_process_group(
-            host, port, dp_rank, dp_size, backend="gloo",
-            return_store=False, listen_socket=s,
-        )
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
-        if dp_coord_group := getattr(self, "dp_coord_group", None):
-            stateless_destroy_torch_distributed_process_group(dp_coord_group)
-            self.dp_coord_group = None
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
@@ -1812,15 +1771,16 @@ class DPEngineCoreProc(EngineCoreProc):
                     if not self._is_coordinated_dp():
                         continue
                     # coord mode: do NOT `continue`. `continue` skips
-                    # _has_global_unfinished_reqs (the has_unfinished all_reduce
-                    # on dp_group), which desyncs the dp_group call count vs the
-                    # peer. The peer (still running has_unfinished) blocks on
-                    # dp_group; this DP loops to the next coord (dp_coord_group)
-                    # and blocks there waiting for the peer's next coord - but the
-                    # peer is stuck at has_unfinished. Cross-group circular
-                    # deadlock (py-spy: DP0@has_unfinished, DP1@coord). Fall
-                    # through to sleep + has_unfinished so both DPs call
-                    # has_unfinished every step (keeps dp_group paired).
+                    # _has_global_unfinished_reqs, which in coord mode reuses
+                    # the combined coord+has_unfinished result from step_fn
+                    # (self._coord_engines_running). Skipping it would leave
+                    # this DP's engines_running stale while the peer's stays
+                    # fresh -> one DP loops (coord) while the other pauses
+                    # (input_queue.get) -> the looping DP blocks in coord
+                    # waiting for the paused DP -> hang (py-spy: DP0@coord,
+                    # DP1@input_queue.get). Fall through to sleep +
+                    # _has_global_unfinished_reqs so both DPs refresh
+                    # engines_running every step.
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
@@ -1863,8 +1823,17 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # step_counter is also published in scheduler stats, so always bump it.
         self.step_counter += 1
+        # Cross-DP coord mode: engines_running was already computed this step
+        # by the combined coord+has_unfinished all_reduce in step_fn
+        # (_coordinate_bt stored it on self._coord_engines_running). Reuse it
+        # instead of a second all_reduce - this keeps engines_running synced
+        # every step on both DPs (no 32-step skip window where stale values
+        # could diverge -> one DP loops while the other pauses -> coord hang).
+        if self._is_coordinated_dp():
+            return bool(getattr(self, "_coord_engines_running", True))
+        # Optimization - only perform finish-sync all-reduce every 32 steps.
         if self.step_counter % 32 != 0:
             return True
 
