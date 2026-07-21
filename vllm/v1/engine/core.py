@@ -1683,11 +1683,52 @@ class DPEngineCoreProc(EngineCoreProc):
         self.dp_rank = dp_rank
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
+        # Second stateless group for cross-DP batch_type coordination. Uses a
+        # DISTINCT store key ("dp_coord_master_port") so it never races with
+        # the main dp_group's "dp_master_port". A separate communicator is
+        # required so the coord all_reduce stream stays independent of the
+        # has_unfinished_dp all_reduce stream on dp_group (the busy-loop
+        # `continue` path skips has_unfinished + step_counter++, which would
+        # otherwise desync the shared-group all_reduce call count -> hang).
+        self.dp_coord_group = self._init_dp_coord_group(parallel_config)
+
+    def _init_dp_coord_group(self, parallel_config):
+        import socket
+        from vllm.distributed.utils import (
+            get_cached_tcp_store_client,
+            stateless_init_torch_distributed_process_group,
+        )
+        host = parallel_config.data_parallel_master_ip
+        dp_rank = parallel_config.data_parallel_rank
+        dp_size = parallel_config.data_parallel_size
+        store_port = parallel_config._coord_store_port
+        key = "dp_coord_master_port"
+        if store_port:
+            store = get_cached_tcp_store_client(host, store_port)
+            if dp_rank == 0:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind((host, 0))
+                s.listen()
+                port = s.getsockname()[1]
+                store.set(key, str(port).encode())
+            else:
+                port = int(store.get(key).decode())
+                s = None
+        else:
+            port = parallel_config.get_next_dp_init_port()
+            s = None
+        return stateless_init_torch_distributed_process_group(
+            host, port, dp_rank, dp_size, backend="gloo",
+            return_store=False, listen_socket=s,
+        )
 
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+        if dp_coord_group := getattr(self, "dp_coord_group", None):
+            stateless_destroy_torch_distributed_process_group(dp_coord_group)
+            self.dp_coord_group = None
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
