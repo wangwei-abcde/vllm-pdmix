@@ -266,6 +266,7 @@ class SharedModelWorkerProc:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+        self.is_moe = vllm_config.model_config.is_moe
 
     # ---------------------------------------------------- MQ setup (overridden)
     def _init_message_queues(
@@ -384,6 +385,7 @@ class SharedModelWorkerProc:
         dp_size = len(self.rpc_broadcast_mqs)
         paused = [False] * dp_size
 
+        init_kv_cache = False
         while True:
             dispatched = False
             for k, mq in enumerate(self.rpc_broadcast_mqs):
@@ -433,6 +435,9 @@ class SharedModelWorkerProc:
                 if (method in self.SYNC_METHODS
                         and not is_empty_execute):
                     paused[k] = True
+                if method == 'initialize_from_config':
+                    paused[k] = True
+                    init_kv_cache = True
             # End-of-round: if every dp_rank has paused at least
             # once in this round, the round is complete. Unpause
             # everyone for the next round AND — crucially — drain
@@ -454,7 +459,12 @@ class SharedModelWorkerProc:
             # loop crashing. The insertion-ordered iteration
             # over ``self._pending_deferred`` preserves
             # dispatch order.
-            if all(paused):
+            if all(paused) or not self.is_moe:
+                if init_kv_cache:
+                    if all(paused):
+                        init_kv_cache = False
+                        paused = [False] * dp_size
+                    continue
                 paused = [False] * dp_size
                 if self._pending_deferred:
                     pending, self._pending_deferred = (

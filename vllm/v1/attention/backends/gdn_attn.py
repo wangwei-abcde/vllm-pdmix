@@ -355,7 +355,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         # Prepare tensors for cudagraph
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
-        batch_size = m.num_actual_tokens
+        batch_size = m.num_reqs
 
         if (
             self.use_full_cuda_graph
