@@ -1242,8 +1242,15 @@ class WorkerProc:
                         except AssertionError:
                             logger.error("[EDGE-DEQUEUE] DP group not initialized")
 
+                    # tokens=0 => cross-DP coordination dummy (routed through
+                    # execute_model, dispatched to _dummy_run by the worker);
+                    # tokens>0 => real batch. total_num_scheduled_tokens is a
+                    # real field that survives RPC serialization (unlike the
+                    # dynamic is_pd_dummy attr), so it is the reliable dummy
+                    # indicator on the worker side.
                     batch_type_info = (
-                        f", batch_type={_bt.value}"
+                        f", batch_type={_bt.value}, tokens="
+                        f"{getattr(args[0], 'total_num_scheduled_tokens', -1) if args else -1}"
                         if method == "execute_model" and _bt is not None
                         else " dummy"
                     )
