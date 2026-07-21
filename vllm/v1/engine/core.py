@@ -1809,7 +1809,18 @@ class DPEngineCoreProc(EngineCoreProc):
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
-                    continue
+                    if not self._is_coordinated_dp():
+                        continue
+                    # coord mode: do NOT `continue`. `continue` skips
+                    # _has_global_unfinished_reqs (the has_unfinished all_reduce
+                    # on dp_group), which desyncs the dp_group call count vs the
+                    # peer. The peer (still running has_unfinished) blocks on
+                    # dp_group; this DP loops to the next coord (dp_coord_group)
+                    # and blocks there waiting for the peer's next coord - but the
+                    # peer is stuck at has_unfinished. Cross-group circular
+                    # deadlock (py-spy: DP0@has_unfinished, DP1@coord). Fall
+                    # through to sleep + has_unfinished so both DPs call
+                    # has_unfinished every step (keeps dp_group paired).
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
