@@ -1129,13 +1129,15 @@ class WorkerProc:
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
 
-                        # [SLICE-DIAG] Log slice_info for cloud dummy to check
-                        # whether the coordinator-produced dummy carries layer
-                        # slice info matching the real DP's slicing.
+                        # [SLICE-DIAG] Always log slice_info for every
+                        # pp_scheduler_output to trace where layer_slice_info
+                        # is lost between enqueue and _dummy_run.
                         _si = slice_info
                         logger.error(
-                            "[SLICE-DIAG] cloud dummy dequeue: slice_info=%s "
+                            "[SLICE-DIAG] dequeue pp_scheduler_output: "
+                            "tokens=%s slice_info=%s "
                             "is_first=%s is_last=%s start=%s end=%s total=%s",
+                            scheduler_output.total_num_scheduled_tokens,
                             type(_si).__name__ if _si is not None else "None",
                             getattr(_si, "is_first_slice", None) if _si is not None else None,
                             getattr(_si, "is_last_slice", None) if _si is not None else None,
