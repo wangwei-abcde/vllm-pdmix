@@ -87,13 +87,25 @@ class AsyncIntermediateTensors(IntermediateTensors):
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
+        import time as _time
+        _t0 = _time.monotonic()
         if self._comm_handles:
             for handle in self._comm_handles:
                 handle.wait()
+        _dt_ms = (_time.monotonic() - _t0) * 1000
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
         self._comm_waited = True
+        # Log wait duration: a long wait means the irecv is blocked waiting
+        # for the remote isend (cloud), which is blocked waiting for cloud
+        # a2a, which is blocked waiting for cloud real (irecv from edge)...
+        # This traces the cross-batch isend/irecv <-> a2a cycle.
+        import logging as _logging
+        _logging.getLogger("vllm").error(
+            "[PP-EVT] WAIT-DONE dt=%.1fms handles=%d",
+            _dt_ms, len(self._comm_handles or []),
+        )
 
     def __getattribute__(self, name: str):
         # ensure `.tensors` is ready before use
