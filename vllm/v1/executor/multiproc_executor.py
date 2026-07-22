@@ -1132,18 +1132,17 @@ class WorkerProc:
                         # [SLICE-DIAG] Log slice_info for cloud dummy to check
                         # whether the coordinator-produced dummy carries layer
                         # slice info matching the real DP's slicing.
-                        if scheduler_output.total_num_scheduled_tokens == 0:
-                            _si = slice_info
-                            logger.error(
-                                "[SLICE-DIAG] cloud dummy dequeue: slice_info=%s "
-                                "is_first=%s is_last=%s start=%s end=%s total=%s",
-                                type(_si).__name__ if _si is not None else "None",
-                                getattr(_si, "is_first_slice", None) if _si is not None else None,
-                                getattr(_si, "is_last_slice", None) if _si is not None else None,
-                                getattr(_si, "start_layer", None) if _si is not None else None,
-                                getattr(_si, "end_layer", None) if _si is not None else None,
-                                getattr(_si, "total_slices", None) if _si is not None else None,
-                            )
+                        _si = slice_info
+                        logger.error(
+                            "[SLICE-DIAG] cloud dummy dequeue: slice_info=%s "
+                            "is_first=%s is_last=%s start=%s end=%s total=%s",
+                            type(_si).__name__ if _si is not None else "None",
+                            getattr(_si, "is_first_slice", None) if _si is not None else None,
+                            getattr(_si, "is_last_slice", None) if _si is not None else None,
+                            getattr(_si, "start_layer", None) if _si is not None else None,
+                            getattr(_si, "end_layer", None) if _si is not None else None,
+                            getattr(_si, "total_slices", None) if _si is not None else None,
+                        )
 
                         dp_group = None
                         if model_parallel_is_initialized():
