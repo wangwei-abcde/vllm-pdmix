@@ -99,6 +99,31 @@ class FutureWrapper(Future):
                 self.set_exception(e)
 
 
+def _mq_depth(mq) -> int:
+    """Return approximate queue depth (unconsumed items) of a MessageQueue.
+
+    Counts chunks in the shared-memory ring buffer whose ``written`` flag
+    is set (byte 0 == 1), meaning the writer has published but not yet
+    recycled the slot.
+    """
+    if mq is None:
+        return -1
+    buf = getattr(mq, "buffer", None)
+    if buf is None:
+        return -1
+    try:
+        import numpy as np
+        with buf.shared_memory.buf[
+            buf.metadata_offset : buf.metadata_offset
+            + buf.metadata_size * buf.max_chunks
+        ] as metadata_buf:
+            flags = np.frombuffer(metadata_buf, dtype=np.uint8)
+            written_flags = flags[:: buf.metadata_size]
+            return int((written_flags == 1).sum())
+    except Exception:
+        return -1
+
+
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
 
@@ -1118,13 +1143,14 @@ class WorkerProc:
                         )
                         logger.error(
                             "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
-                            "world_size=%d, ranks=%s%s",
+                            "world_size=%d, ranks=%s%s, mq_depth=%d",
                             loop_step,
                             dp_group.rank if dp_group is not None else -1,
                             dp_group.rank_in_group if dp_group is not None else -1,
                             dp_group.world_size if dp_group is not None else -1,
                             dp_group.ranks if dp_group is not None else None,
                             batch_type_info,
+                            _mq_depth(self.local_rpc_broadcast_mq),
                         )
 
                         # Execute model with the received SchedulerOutput.
@@ -1149,9 +1175,10 @@ class WorkerProc:
                                     layer_slice_info=slice_info,
                                 )
                             logger.error(
-                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done, mq_depth=%d",
                                 loop_step,
                                 dp_group.rank if dp_group is not None else -1,
+                                _mq_depth(self.local_rpc_broadcast_mq),
                             )
                             loop_step += 1
                         except Exception as e:
@@ -1256,21 +1283,23 @@ class WorkerProc:
                     )
                     logger.error(
                         "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
-                        "world_size=%d, ranks=%s%s",
+                        "world_size=%d, ranks=%s%s, mq_depth=%d",
                         loop_step,
                         dp_group.rank if dp_group is not None else -1,
                         dp_group.rank_in_group if dp_group is not None else -1,
                         dp_group.world_size if dp_group is not None else -1,
                         dp_group.ranks if dp_group is not None else None,
                         batch_type_info,
+                        _mq_depth(self.rpc_broadcast_mq),
                     )
 
                 output = func(*args, **kwargs)
                 if method in ("execute_model", "execute_dummy_batch"):
                     logger.error(
-                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done, mq_depth=%d",
                         loop_step,
                         dp_group.rank if dp_group is not None else -1,
+                        _mq_depth(self.rpc_broadcast_mq),
                     )
                     loop_step += 1
             except Exception as e:
