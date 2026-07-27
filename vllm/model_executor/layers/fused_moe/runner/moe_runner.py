@@ -698,8 +698,20 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         if self.do_naive_dispatch_combine:
+            try:
+                import torch.distributed as _d
+                _r = _d.get_rank() if _d.is_initialized() else -1
+            except Exception:
+                _r = -1
+            import logging as _lg
+            _lg.getLogger("vllm").error(
+                "[DPDBG] moe_combine ENTER r=%s hs=%s", _r, tuple(hidden_states.shape),
+            )
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
+            )
+            _lg.getLogger("vllm").error(
+                "[DPDBG] moe_combine EXIT r=%s hs=%s", _r, tuple(hidden_states.shape),
             )
 
         if self.moe_config.pcp_size > 1:
