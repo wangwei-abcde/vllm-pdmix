@@ -1323,6 +1323,15 @@ class GPUModelRunner(
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
+                    if req_id not in req_data.all_token_ids:
+                        print(
+                            f"[DEBUG] KeyError would happen! req_id={req_id}, "
+                            f"all_token_ids keys={list(req_data.all_token_ids.keys())[:30]}, "
+                            f"num_output_tokens={num_output_tokens}, "
+                            f"resumed_req_ids={req_data.resumed_req_ids}, "
+                            f"dp_rank={self.dp_rank}, "
+                            f"req_data.num_reqs={len(req_data.req_ids)}"
+                        )
                     resumed_token_ids = req_data.all_token_ids[req_id]
                     # resumed_token_ids is an np.ndarray(int32) on the wire
                     # (see scheduler._make_cached_request_data). .tolist()

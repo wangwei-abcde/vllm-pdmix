@@ -67,7 +67,8 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
-from vllm.v1.outputs import AsyncModelRunnerOutput
+from vllm.v1.core.sched.output import BatchType
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -89,6 +90,19 @@ logger = init_logger(__name__)
 def _is_batched_execute_marker(obj: Any) -> bool:
     return (getattr(obj, "bundle", None) is not None
             and getattr(obj, "worker", None) is not None)
+
+
+# PD-separation batch-type sets. FIRST markers do head-forward + isend;
+# LAST markers do recv + tail-forward. Non-PD types fall through to the
+# existing batched-pre path (unchanged).
+_PD_FIRST_TYPES = frozenset({
+    BatchType.PREFILL_FIRST,
+    BatchType.DECODE_FIRST,
+})
+_PD_LAST_TYPES = frozenset({
+    BatchType.PREFILL_LAST,
+    BatchType.DECODE_LAST,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -471,109 +485,117 @@ class SharedModelWorkerProc:
                         self._pending_deferred, {})
 
                     # Step 11 batched-compute path: when the
-                    # ``_dispatch`` step accumulated
-                    # :class:`_BatchedExecuteMarker`s, drive the
-                    # batched round via the marker's class and
-                    # member functions. Phase A (1× batched head +
-                    # per-dp_rank PP isend + recv closure) runs
-                    # first; Phase B/C (recv + 1× batched tail +
-                    # per-dp_rank post_batched + handle_output)
-                    # runs at the end. The marker is the single
-                    # owner of all the batched logic — the
-                    # busy_loop only routes the round state dicts
-                    # and the response-MQ callback.
+                    # ``_dispatch`` step accumulated marker
+                    # instances, drive the batched round via the
+                    # marker's class and member functions.
                     #
-                    # Mixed-SYNC partitioning: the batched path
-                    # only operates on the dp_ranks that produced
-                    # batched markers in this round. Any
-                    # non-batched entries in ``pending`` (legacy
-                    # ``DeferredExecutePostprocess`` from the
-                    # original ``execute_model`` path, used by
-                    # non-batched callers) are routed through the
-                    # legacy ``deferred()`` loop below — that path
-                    # runs the original head + send / tail recv +
-                    # tail forward end-to-end and is fully
-                    # independent of the batched path. This way
-                    # the batched head / tail / post only see
-                    # the dp_ranks that actually want to be
-                    # merged.
+                    # PD-separation: markers are split into three
+                    # groups — FIRST (head+send only), LAST
+                    # (recv+tail only), and non-PD (full
+                    # head+send+recv+tail, unchanged). The three
+                    # groups must NOT be merged because their
+                    # processing logic differs completely.
                     batched_dp_ranks_list = sorted(
                         k for k, d in pending.items()
                         if _is_batched_execute_marker(d))
-                    batched_pending: dict[int, Any] = {
-                        k: pending[k] for k in batched_dp_ranks_list
-                    }
-                    legacy_pending: dict[int, Any] = {
-                        k: d for k, d in pending.items()
-                        if k not in batched_pending
-                    }
-                    if batched_pending:
-                        # Phase A — batched head (1× per round).
-                        # ``run_batched_head`` and ``drain_batched_round``
-                        # are class functions on the vllm_ascend
-                        # ``_BatchedExecuteMarker``; reach them via
-                        # ``type(marker)`` to avoid an upstream
-                        # import of vllm_ascend.
-                        marker_cls = type(batched_pending[
-                            batched_dp_ranks_list[0]])
+
+                    # Three-way split by marker type.
+                    # Duck-typed: FIRST/LAST markers are subclasses
+                    # of the vllm_ascend batched-marker hierarchy;
+                    # we detect them by class name to avoid an
+                    # import of vllm_ascend in this upstream module.
+                    _first_cls_name = "_FirstRoundMarker"
+                    _last_cls_name = "_LastRoundMarker"
+                    first_dp_ranks = [
+                        k for k in batched_dp_ranks_list
+                        if type(pending[k]).__name__ == _first_cls_name
+                    ]
+                    last_dp_ranks = [
+                        k for k in batched_dp_ranks_list
+                        if type(pending[k]).__name__ == _last_cls_name
+                    ]
+                    nonpd_dp_ranks = [
+                        k for k in batched_dp_ranks_list
+                        if k not in first_dp_ranks
+                        and k not in last_dp_ranks
+                    ]
+
+                    logger.info(
+                        "[PD] ROUND END state: first_dp=%s last_dp=%s "
+                        "nonpd_dp=%s all_batched=%s",
+                        first_dp_ranks, last_dp_ranks,
+                        nonpd_dp_ranks, batched_dp_ranks_list)
+
+                    # ── Branch A: FIRST markers — head + isend ──
+                    self._process_first_markers(pending, first_dp_ranks)
+
+                    # ── Branch B: LAST markers — recv + tail ──
+                    self._process_last_markers(pending, last_dp_ranks)
+
+                    # ── Branch C: non-PD markers — full round ──
+                    if nonpd_dp_ranks:
+                        nonpd_pending: dict[int, Any] = {
+                            k: pending[k] for k in nonpd_dp_ranks
+                        }
+                        marker_cls = type(
+                            nonpd_pending[nonpd_dp_ranks[0]])
                         try:
                             marker_cls.run_batched_head(
-                                batched_dp_ranks_list,
+                                nonpd_dp_ranks,
                                 self._round_bundles)
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
                             logger.exception(
-                                "SharedModelWorkerProc hit an exception "
-                                "running batched head.")
-                            for k in batched_dp_ranks_list:
+                                "SharedModelWorkerProc hit an "
+                                "exception running batched head.")
+                            for k in nonpd_dp_ranks:
                                 self.handle_output(k, e)
                             self._round_bundles.clear()
                             self._round_intermediates.clear()
                             marker_cls._per_dp_hidden = None
-                            dispatched = True
-                            continue
+                            nonpd_dp_ranks = []
 
-                        # Phase A — per-dp_rank PP isend + recv
-                        # closure. Each batched marker installs its
-                        # own recv closure into ``batched_pending``.
-                        drive_failures: dict[int, Exception] = {}
-                        for dp_rank, marker in batched_pending.items():
-                            try:
-                                marker.drive_batched_round(
-                                    batched_pending)
-                            except Exception as e:
-                                if hasattr(e, "add_note"):
-                                    e.add_note(traceback.format_exc())
-                                logger.exception(
-                                    "SharedModelWorkerProc hit an "
-                                    "exception running per-dp_rank "
-                                    "PP isend / recv closure on "
-                                    "dp_rank=%d.", dp_rank)
-                                drive_failures[dp_rank] = e
+                        if nonpd_dp_ranks:
+                            drive_failures2: dict[
+                                int, Exception] = {}
+                            for dp_rank, marker in (
+                                    nonpd_pending.items()):
+                                try:
+                                    marker.drive_batched_round(
+                                        nonpd_pending)
+                                except Exception as e:
+                                    if hasattr(e, "add_note"):
+                                        e.add_note(
+                                            traceback.format_exc())
+                                    logger.exception(
+                                        "SharedModelWorkerProc "
+                                        "hit an exception running "
+                                        "per-dp_rank PP isend / "
+                                        "recv closure on "
+                                        "dp_rank=%d.", dp_rank)
+                                    drive_failures2[dp_rank] = e
 
-                        # Surface any per-dp_rank Phase A failure as
-                        # a FAILURE response on its MQ.
-                        for k, e in drive_failures.items():
-                            self.handle_output(k, e)
-                            self._round_bundles.pop(k, None)
-                            batched_pending.pop(k, None)
+                            for k, e in drive_failures2.items():
+                                self.handle_output(k, e)
+                                self._round_bundles.pop(k, None)
+                                nonpd_pending.pop(k, None)
 
-                        # Phase B/C — recv + batched tail + per-dp_rank
-                        # post_batched + handle_output. The marker
-                        # class function drives this end-to-end,
-                        # operating only on ``batched_pending``.
-                        marker_cls.drain_batched_round(
-                            self._round_bundles,
-                            self._round_intermediates,
-                            batched_pending,
-                            on_dp_rank_output=self.handle_output,
-                        )
-                        # ``drain_batched_round`` has cleared
-                        # ``_round_bundles`` / ``_round_intermediates``
-                        # at end-of-round; the legacy entries have
-                        # not been touched and are still in
-                        # ``legacy_pending`` below.
+                            marker_cls.drain_batched_round(
+                                self._round_bundles,
+                                self._round_intermediates,
+                                nonpd_pending,
+                                on_dp_rank_output=(
+                                    self.handle_output),
+                            )
+
+                    # Build legacy_pending from dp_ranks not in
+                    # any batched group.
+                    all_batched = set(batched_dp_ranks_list)
+                    legacy_pending: dict[int, Any] = {
+                        k: d for k, d in pending.items()
+                        if k not in all_batched
+                    }
 
                     # Legacy / non-batched path: each
                     # ``deferred`` is either a legacy
@@ -623,18 +645,39 @@ class SharedModelWorkerProc:
         """
         virtual_worker = self.worker[dp_rank]
         try:
-            # Step 11 batched path: route ``execute_model`` RPCs to
-            # the new ``execute_model_batched_pre`` interface, which
-            # only does per-dp_rank preprocess and returns a
-            # ``_BatchedExecuteMarker`` (or an early-return
-            # ``ModelRunnerOutput`` / ``None`` for no-work cases).
-            # The original head + send path of ``execute_model`` is
-            # not taken; the busy_loop drives the batched head / tail
-            # / per-dp_rank post on the leader runner.
-            if method == "execute_model" and hasattr(
-                    virtual_worker, "execute_model_batched_pre"):
-                output = virtual_worker.execute_model_batched_pre(
-                    args[0] if args else None)
+            # PD-separation + batched-pre routing by batch_type.
+            # - FIRST types → execute_model_head_pre → _FirstRoundMarker
+            # - LAST  types → execute_model_tail_pre → _LastRoundMarker
+            # - non-PD     → execute_model_batched_pre (unchanged)
+            if method == "execute_model":
+                so = args[0] if args else None
+                bt = getattr(so, "batch_type", None)
+
+                # PD 分离: FIRST — head forward + isend
+                if bt in _PD_FIRST_TYPES and hasattr(
+                        virtual_worker, "execute_model_head_pre"):
+                    logger.info(
+                        "[PD] _dispatch: dp_rank=%d batch_type=%s → "
+                        "execute_model_head_pre",
+                        dp_rank, bt)
+                    output = virtual_worker.execute_model_head_pre(so)
+
+                # PD 分离: LAST — recv + tail forward
+                elif bt in _PD_LAST_TYPES and hasattr(
+                        virtual_worker, "execute_model_tail_pre"):
+                    logger.info(
+                        "[PD] _dispatch: dp_rank=%d batch_type=%s → "
+                        "execute_model_tail_pre",
+                        dp_rank, bt)
+                    output = virtual_worker.execute_model_tail_pre(so)
+
+                # 非 PD 分离 (原路径，不变)
+                elif hasattr(virtual_worker, "execute_model_batched_pre"):
+                    output = virtual_worker.execute_model_batched_pre(so)
+
+                else:
+                    func = getattr(virtual_worker, method)
+                    output = func(*args, **kwargs)
             elif isinstance(method, str):
                 func = getattr(virtual_worker, method)
                 output = func(*args, **kwargs)
@@ -675,6 +718,137 @@ class SharedModelWorkerProc:
                 self._pending_deferred[dp_rank] = output
             else:
                 self.handle_output(dp_rank, output)
+
+    # ------------------------------------------------- PD-separation helpers
+    def _process_first_markers(
+        self,
+        pending: dict[int, Any],
+        first_dp_ranks: list[int],
+    ) -> None:
+        """Process FIRST markers: batched head + isend.
+
+        Phase A only — no recv / tail / logits. FIRST and LAST
+        operate on completely independent requests. LAST constructs
+        its own bundle via ``execute_model_pre`` (no cross-round
+        bundle sharing).
+        """
+        if not first_dp_ranks:
+            return
+
+        logger.info("[PD] _process_first_markers: dp_ranks=%s", first_dp_ranks)
+        first_marker_cls = type(pending[first_dp_ranks[0]])
+        try:
+            first_marker_cls.run_batched_head(
+                first_dp_ranks, self._round_bundles)
+        except Exception as e:
+            if hasattr(e, "add_note"):
+                e.add_note(traceback.format_exc())
+            logger.exception(
+                "SharedModelWorkerProc hit an exception running "
+                "FIRST batched head.")
+            for k in first_dp_ranks:
+                self.handle_output(k, e)
+            self._round_bundles.clear()
+            first_marker_cls._per_dp_hidden = None
+            return
+
+        # Per-dp_rank isend (no recv closure — LAST does direct recv).
+        drive_failures: dict[int, Exception] = {}
+        for k in first_dp_ranks:
+            try:
+                pending[k].drive_head_send()
+                logger.info(
+                    "[PD] FIRST isend done (async): dp_rank=%d dst=%d",
+                    k, k + 1)
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception(
+                    "SharedModelWorkerProc hit an exception "
+                    "running FIRST drive_head_send on dp_rank=%d.",
+                    k)
+                drive_failures[k] = e
+
+        for k, e in drive_failures.items():
+            self.handle_output(k, e)
+            self._round_bundles.pop(k, None)
+            first_dp_ranks.remove(k)
+
+        # Return a placeholder ModelRunnerOutput carrying req_ids so
+        # EngineCore can correlate the batch without sampled tokens.
+        # Sampling happens in the LAST phase. Mirrors
+        # NPUWorker._execute_model_edge_head behaviour.
+        for k in first_dp_ranks:
+            marker = pending[k]
+            so = marker.bundle.scheduler_output
+            req_ids = list(so.num_scheduled_tokens.keys())
+            output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            )
+            self.handle_output(k, output)
+
+    def _process_last_markers(
+        self,
+        pending: dict[int, Any],
+        last_dp_ranks: list[int],
+    ) -> None:
+        """Process LAST markers: recv + tail forward + logits.
+
+        Recv is done directly via ``_LastRoundMarker.do_direct_recv``
+        (mirrors ``NPUWorker._execute_model_edge_tail`` — no closure).
+        Bundles come from ``_round_bundles`` — LAST built its own via
+        ``execute_model_pre``, independent of FIRST.
+        """
+        if not last_dp_ranks:
+            return
+
+        logger.info("[PD] _process_last_markers: dp_ranks=%s", last_dp_ranks)
+        last_bundles: dict[int, Any] = {}
+        for k in list(last_dp_ranks):
+            # Step 1 — direct recv (no pre-stored closure).
+            logger.info(
+                "[PD] LAST calling do_direct_recv: dp_rank=%d src=%d",
+                k, k + 1)
+            try:
+                intermediate = pending[k].do_direct_recv()
+                logger.info(
+                    "[PD] LAST recv done: dp_rank=%d", k)
+                self._round_intermediates[k] = intermediate
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception(
+                    "SharedModelWorkerProc hit an exception "
+                    "running LAST do_direct_recv on dp_rank=%d.",
+                    k)
+                self.handle_output(k, e)
+                self._round_bundles.pop(k, None)
+                last_dp_ranks.remove(k)
+                continue
+
+            # Step 2 — take this LAST marker's own bundle
+            # (built by execute_model_pre, stored by _dispatch).
+            last_bundles[k] = self._round_bundles.pop(k)
+
+        if not last_dp_ranks:
+            return
+
+        logger.info(
+            "[PD] LAST drain_batched_round START: dp_ranks=%s "
+            "n_bundles=%d n_intermediates=%d",
+            last_dp_ranks, len(last_bundles),
+            len(self._round_intermediates))
+        last_marker_cls = type(pending[last_dp_ranks[0]])
+        last_marker_cls.drain_batched_round(
+            last_bundles,
+            self._round_intermediates,
+            {},
+            on_dp_rank_output=self.handle_output,
+        )
+        logger.info(
+            "[PD] LAST drain_batched_round DONE: dp_ranks=%s",
+            last_dp_ranks)
 
     def handle_output(self, dp_rank: int, output: Any) -> None:
         """Route a worker output to the matching dp_rank response
