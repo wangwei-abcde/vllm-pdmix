@@ -1142,7 +1142,9 @@ class WorkerProc:
                         # keeping the cloud/edge dummy paths symmetric.
                         try:
                             if scheduler_output.total_num_scheduled_tokens == 0:
-                                output = self.worker.execute_dummy_batch()
+                                output = self.worker.execute_dummy_batch(
+                                    layer_slice_info=slice_info,
+                                )
                             else:
                                 output = self.worker.execute_model(
                                     scheduler_output,
