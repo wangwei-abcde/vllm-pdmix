@@ -1760,11 +1760,32 @@ class DPEngineCoreProc(EngineCoreProc):
             if not executed:
                 if not local_unfinished_reqs and not self.engines_running:
                     # All engines are idle.
-                    continue
+                    if not self._is_coordinated_dp():
+                        continue
+                    # coord mode: do NOT `continue`. `continue` skips
+                    # _has_global_unfinished_reqs, which in coord mode reuses
+                    # the combined coord+has_unfinished result from step_fn
+                    # (self._coord_engines_running). Skipping it would leave
+                    # this DP's engines_running stale while the peer's stays
+                    # fresh -> one DP loops (coord) while the other pauses
+                    # (input_queue.get) -> the looping DP blocks in coord
+                    # waiting for the paused DP -> hang (py-spy: DP0@coord,
+                    # DP1@input_queue.get). Fall through to sleep +
+                    # _has_global_unfinished_reqs so both DPs refresh
+                    # engines_running every step.
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                if self._is_coordinated_dp():
+                    # Cross-DP coordination already produces dummy
+                    # SchedulerOutputs (via _schedule_target) when pairing is
+                    # needed; reaching here with not-executed means both DPs
+                    # are waiting for cloud (winner=EMPTY). Do NOT self-drive
+                    # a dummy - that reintroduces the count-drift deadlock.
+                    # Yield briefly and wait for cloud to return work.
+                    time.sleep(0.001)
+                else:
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
@@ -1794,8 +1815,17 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # step_counter is also published in scheduler stats, so always bump it.
         self.step_counter += 1
+        # Cross-DP coord mode: engines_running was already computed this step
+        # by the combined coord+has_unfinished all_reduce in step_fn
+        # (_coordinate_bt stored it on self._coord_engines_running). Reuse it
+        # instead of a second all_reduce - this keeps engines_running synced
+        # every step on both DPs (no 32-step skip window where stale values
+        # could diverge -> one DP loops while the other pauses -> coord hang).
+        if self._is_coordinated_dp():
+            return bool(getattr(self, "_coord_engines_running", True))
+        # Optimization - only perform finish-sync all-reduce every 32 steps.
         if self.step_counter % 32 != 0:
             return True
 

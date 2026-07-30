@@ -1091,6 +1091,7 @@ class WorkerProc:
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
+        loop_step = 0
         while True:
             # Poll local MQ for pp scheduler output from passive
             # EngineCore (non-blocking).
@@ -1102,13 +1103,59 @@ class WorkerProc:
                     if isinstance(method, bytes) and method == b"pp_scheduler_output":
                         scheduler_output = args[0]
                         slice_info = args[1] if len(args) > 1 else None
+
+                        dp_group = None
+                        if model_parallel_is_initialized():
+                            try:
+                                dp_group = get_dp_group()
+                            except AssertionError:
+                                logger.error("[EDGE-DEQUEUE] DP group not initialized")
+
+                        batch_type_info = (
+                            f", batch_type={scheduler_output.batch_type.value}"
+                            if scheduler_output.total_num_scheduled_tokens != 0
+                            else " dummy"
+                        )
+                        logger.info(
+                            "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                            "world_size=%d, ranks=%s%s",
+                            loop_step,
+                            dp_group.rank if dp_group is not None else -1,
+                            dp_group.rank_in_group if dp_group is not None else -1,
+                            dp_group.world_size if dp_group is not None else -1,
+                            dp_group.ranks if dp_group is not None else None,
+                            batch_type_info,
+                        )
+
                         # Execute model with the received SchedulerOutput.
+                        # PD-separation: route a dummy-middle
+                        # (total_num_scheduled_tokens == 0, published by the edge's
+                        # _patched_execute_dummy_batch) to execute_dummy_batch
+                        # instead of execute_model. The execute_model path runs
+                        # _wait_pp_send_work (which, for the dummy's
+                        # batch_type=DECODE_FIRST, waits the DECODE hidden channel)
+                        # before reaching _execute_model_cloud's dummy branch - that
+                        # makes a cloud dummy block on a prior real step's
+                        # un-recv'd isend and skews the cross-DP pairing.
+                        # execute_dummy_batch goes straight to _dummy_run (no PP send
+                        # wait), matching how the edge handles its own dummies and
+                        # keeping the cloud/edge dummy paths symmetric.
                         try:
-                            func = getattr(self.worker, "execute_model")
-                            output = func(
-                                scheduler_output,
-                                layer_slice_info=slice_info,
+                            if scheduler_output.total_num_scheduled_tokens == 0:
+                                output = self.worker.execute_dummy_batch(
+                                    layer_slice_info=slice_info,
+                                )
+                            else:
+                                output = self.worker.execute_model(
+                                    scheduler_output,
+                                    layer_slice_info=slice_info,
+                                )
+                            logger.info(
+                                "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                                loop_step,
+                                dp_group.rank if dp_group is not None else -1,
                             )
+                            loop_step += 1
                         except Exception as e:
                             if hasattr(e, "add_note"):
                                 e.add_note(traceback.format_exc())
@@ -1134,7 +1181,7 @@ class WorkerProc:
                             (output_rank is None and self.local_rank == 0)
                             or self.rank == output_rank
                         )
-                        if should_send_ack:
+                        if should_send_ack and scheduler_output.total_num_scheduled_tokens != 0:
                             response_mq = (
                                 self.local_worker_response_mq
                                 if self.local_worker_response_mq is not None
@@ -1159,13 +1206,17 @@ class WorkerProc:
             except TimeoutError:
                 continue
 
-            # Skip execute_model from cross-node MQ on pp rank1 workers.
-            # These workers execute model only when triggered by their
-            # local passive EngineCore via local_rpc_broadcast_mq.
+            # Skip execute_model / execute_dummy_batch from cross-node MQ on
+            # pp rank1 (cloud) workers. These workers run model/dummy only
+            # when triggered by their local passive EngineCore via
+            # local_rpc_broadcast_mq (zmq-driven, per-DP). Letting the edge's
+            # cross-node broadcast reach cloud workers would deliver the idle
+            # DP's dummy to the DP that is running real work, breaking the
+            # cross-DP all_reduce pairing (deadlock). See 方案③.
             if (
                 self.local_rpc_broadcast_mq is not None
                 and isinstance(method, str)
-                and method == "execute_model"
+                and method in ("execute_model", "execute_dummy_batch")
             ):
                 continue
 
@@ -1174,6 +1225,7 @@ class WorkerProc:
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
+                _bt = None
                 if method == "execute_model":
                     _bt = (
                         getattr(args[0], "batch_type", None)
@@ -1184,7 +1236,45 @@ class WorkerProc:
                         _dt_ms,
                         _bt.value if _bt is not None else "N/A",
                     )
+                if method in ("execute_model", "execute_dummy_batch"):
+                    dp_group = None
+                    if model_parallel_is_initialized():
+                        try:
+                            dp_group = get_dp_group()
+                        except AssertionError:
+                            logger.error("[EDGE-DEQUEUE] DP group not initialized")
+
+                    # tokens=0 => cross-DP coordination dummy (routed through
+                    # execute_model, dispatched to _dummy_run by the worker);
+                    # tokens>0 => real batch. total_num_scheduled_tokens is a
+                    # real field that survives RPC serialization (unlike the
+                    # dynamic is_pd_dummy attr), so it is the reliable dummy
+                    # indicator on the worker side.
+                    batch_type_info = (
+                        f", batch_type={_bt.value}, tokens="
+                        f"{getattr(args[0], 'total_num_scheduled_tokens', -1) if args else -1}"
+                        if method == "execute_model" and _bt is not None
+                        else " dummy"
+                    )
+                    logger.info(
+                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, rank_in_group=%d, "
+                        "world_size=%d, ranks=%s%s",
+                        loop_step,
+                        dp_group.rank if dp_group is not None else -1,
+                        dp_group.rank_in_group if dp_group is not None else -1,
+                        dp_group.world_size if dp_group is not None else -1,
+                        dp_group.ranks if dp_group is not None else None,
+                        batch_type_info,
+                    )
+
                 output = func(*args, **kwargs)
+                if method in ("execute_model", "execute_dummy_batch"):
+                    logger.info(
+                        "[EDGE-DEQUEUE] DP info: loop_step: %d, rank=%d, done",
+                        loop_step,
+                        dp_group.rank if dp_group is not None else -1,
+                    )
+                    loop_step += 1
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
