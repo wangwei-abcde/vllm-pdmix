@@ -441,13 +441,21 @@ class SharedModelWorkerProc:
                 # regardless of the batch size, so this just
                 # means the pause is only triggered by the
                 # "real" forward calls.
+                #
+                # For MoE models, even an empty step MUST gate the
+                # round barrier.  The MoE round condition is
+                # ``all(paused)`` (no short-circuit via
+                # ``not self.is_moe``), so an idle dp_rank
+                # skipping pause would starve the other dp_rank
+                # indefinitely — its deferred marker (e.g. a
+                # pending PP recv) would never be drained.
                 is_empty_execute = (
                     method == "execute_model"
                     and args
                     and getattr(args[0],
                                 "total_num_scheduled_tokens", 0) == 0)
                 if (method in self.SYNC_METHODS
-                        and not is_empty_execute):
+                        and (not is_empty_execute or self.is_moe)):
                     paused[k] = True
                 if method == 'initialize_from_config':
                     paused[k] = True
